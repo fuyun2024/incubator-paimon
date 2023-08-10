@@ -18,6 +18,7 @@
 
 package org.apache.paimon.flink.action.cdc.mysql;
 
+import org.apache.paimon.flink.action.cdc.mysql.sf.HostConfig;
 import org.apache.paimon.flink.sink.cdc.UpdatedDataFieldsProcessFunction;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.TableSchema;
@@ -171,7 +172,25 @@ class MySqlActionUtils {
                 .password(mySqlConfig.get(MySqlSourceOptions.PASSWORD))
                 .databaseList(databaseName)
                 .tableList(databaseName + "." + tableName);
+        return buildMySqlSource(sourceBuilder, mySqlConfig);
+    }
 
+    static MySqlSource<String> buildMySqlSource(HostConfig hostConfig, Configuration mySqlConfig) {
+        String databaseName = hostConfig.getDatabase();
+        String tableName = hostConfig.getTable();
+        MySqlSourceBuilder<String> sourceBuilder = MySqlSource.builder();
+        sourceBuilder
+                .hostname(hostConfig.getHostName())
+                .port(hostConfig.getPort())
+                .username(hostConfig.getUsername())
+                .password(hostConfig.getPassword())
+                .databaseList(databaseName)
+                .tableList(databaseName + "." + tableName);
+        return buildMySqlSource(sourceBuilder, mySqlConfig);
+    }
+
+    static MySqlSource<String> buildMySqlSource(
+            MySqlSourceBuilder<String> sourceBuilder, Configuration mySqlConfig) {
         mySqlConfig.getOptional(MySqlSourceOptions.SERVER_ID).ifPresent(sourceBuilder::serverId);
         mySqlConfig
                 .getOptional(MySqlSourceOptions.SERVER_TIME_ZONE)

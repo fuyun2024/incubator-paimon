@@ -23,6 +23,8 @@ import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.FlinkCatalogFactory;
 import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.flink.action.Action;
+import org.apache.paimon.flink.action.cdc.mysql.sf.HostConfig;
+import org.apache.paimon.flink.action.cdc.mysql.sf.MultipleHostOptions;
 import org.apache.paimon.flink.sink.cdc.EventParser;
 import org.apache.paimon.flink.sink.cdc.FlinkCdcSyncTableSinkBuilder;
 import org.apache.paimon.options.CatalogOptions;
@@ -30,12 +32,15 @@ import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.FileStoreTable;
 
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import com.ververica.cdc.connectors.mysql.source.MySqlSource;
 import com.ververica.cdc.connectors.mysql.source.config.MySqlSourceOptions;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.utils.MultipleParameterTool;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
 import java.sql.Connection;
@@ -53,6 +58,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.flink.action.Action.getConfigMap;
+import static org.apache.paimon.flink.action.cdc.mysql.MySqlActionUtils.buildMySqlSource;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /**
@@ -141,7 +147,38 @@ public class MySqlSyncTableAction implements Action {
     }
 
     public void build(StreamExecutionEnvironment env) throws Exception {
-        MySqlSource<String> source = MySqlActionUtils.buildMySqlSource(mySqlConfig);
+        DataStream<String> input;
+        Optional<Boolean> multipleHostEnabled =
+                mySqlConfig.getOptional(MultipleHostOptions.MULTIPLE_HOST_ENABLED);
+        if (multipleHostEnabled.isPresent() && multipleHostEnabled.get()) {
+            Optional<String> hostListOptional =
+                    mySqlConfig.getOptional(MultipleHostOptions.HOST_JSON_LIST);
+            checkArgument(
+                    hostListOptional.isPresent(),
+                    String.format(
+                            "In the configuration 'multiple-host-enabled' mode, 'host-json-list' must be configured"));
+
+            List<HostConfig> hostConfigList =
+                    new Gson()
+                            .fromJson(
+                                    hostListOptional.get(),
+                                    new TypeToken<List<HostConfig>>() {}.getType());
+
+            HostConfig firstConfig = hostConfigList.get(0);
+            flushToConfig(firstConfig, mySqlConfig);
+            if (hostConfigList.size() == 1) {
+                input = getOneSourceStream(env, firstConfig);
+            } else {
+                input = getShardingSourceStream(env, hostConfigList);
+            }
+        } else {
+            MySqlSource<String> source = buildMySqlSource(mySqlConfig);
+            input =
+                    env.fromSource(source, WatermarkStrategy.noWatermarks(), "MySQL Source")
+                            .setParallelism(4)
+                            .name("cdc-" + mySqlConfig.get(MySqlSourceOptions.HOSTNAME))
+                            .uid("cdc-" + mySqlConfig.get(MySqlSourceOptions.HOSTNAME));
+        }
 
         Catalog catalog =
                 FlinkCatalogFactory.createPaimonCatalog(
@@ -193,9 +230,7 @@ public class MySqlSyncTableAction implements Action {
 
         FlinkCdcSyncTableSinkBuilder<String> sinkBuilder =
                 new FlinkCdcSyncTableSinkBuilder<String>()
-                        .withInput(
-                                env.fromSource(
-                                        source, WatermarkStrategy.noWatermarks(), "MySQL Source"))
+                        .withInput(input)
                         .withParserFactory(parserFactory)
                         .withTable(table);
         String sinkParallelism = tableConfig.get(FlinkConnectorOptions.SINK_PARALLELISM.key());
@@ -259,6 +294,56 @@ public class MySqlSyncTableAction implements Action {
             }
         }
         return mySqlSchemaList;
+    }
+
+    private void flushToConfig(HostConfig hostConfig, Configuration mySqlConfig) {
+        mySqlConfig.set(MySqlSourceOptions.HOSTNAME, hostConfig.getHostName());
+        mySqlConfig.set(MySqlSourceOptions.PORT, hostConfig.getPort());
+        mySqlConfig.set(MySqlSourceOptions.USERNAME, hostConfig.getUsername());
+        mySqlConfig.set(MySqlSourceOptions.PASSWORD, hostConfig.getPassword());
+        mySqlConfig.set(MySqlSourceOptions.DATABASE_NAME, hostConfig.getDatabase());
+        mySqlConfig.set(MySqlSourceOptions.TABLE_NAME, hostConfig.getTable());
+    }
+
+    public DataStream<String> getOneSourceStream(
+            StreamExecutionEnvironment env, HostConfig hostConfig) {
+        int sourceParallelism = 4;
+        MySqlSource<String> mySqlSource = buildMySqlSource(hostConfig, mySqlConfig);
+        return env.fromSource(mySqlSource, WatermarkStrategy.noWatermarks(), "mysql-cdc")
+                .setParallelism(sourceParallelism)
+                .name("cdc-" + hostConfig.getHostName())
+                .uid("cdc-" + hostConfig.getHostName());
+    }
+
+    public DataStream<String> getShardingSourceStream(
+            StreamExecutionEnvironment env, List<HostConfig> hostConfigList) {
+        HostConfig hostConfig = hostConfigList.get(0);
+        int slotSharingGroupNum = 10;
+        int sourceParallelism = 4;
+        MySqlSource<String> mySqlSource = buildMySqlSource(hostConfig, mySqlConfig);
+        DataStream<String> mySqlSourceStream =
+                env.fromSource(mySqlSource, WatermarkStrategy.noWatermarks(), "mysql-cdc")
+                        .setParallelism(sourceParallelism)
+                        .slotSharingGroup("GROUP-" + 0)
+                        .name("cdc-" + hostConfig.getHostName())
+                        .uid("cdc-" + hostConfig.getHostName());
+
+        List<DataStream<String>> streamList = new ArrayList<>();
+        for (int i = 1; i < hostConfigList.size(); i++) {
+            MySqlSource<String> shardingMySqlSource =
+                    buildMySqlSource(hostConfigList.get(i), mySqlConfig);
+            DataStream<String> sourceStream =
+                    env.fromSource(
+                                    shardingMySqlSource,
+                                    WatermarkStrategy.noWatermarks(),
+                                    "mysql-cdc")
+                            .setParallelism(sourceParallelism)
+                            .slotSharingGroup("GROUP-" + (i / slotSharingGroupNum))
+                            .name("cdc-" + hostConfigList.get(i).getHostName())
+                            .uid("cdc-" + hostConfigList.get(i).getHostName());
+            streamList.add(sourceStream);
+        }
+        return mySqlSourceStream.union(streamList.toArray(new DataStream[streamList.size()]));
     }
 
     // ------------------------------------------------------------------------
@@ -357,7 +442,8 @@ public class MySqlSyncTableAction implements Action {
                         + "are required configurations, others are optional.");
         System.out.println(
                 "For a complete list of supported configurations, "
-                        + "see https://ververica.github.io/flink-cdc-connectors/master/content/connectors/mysql-cdc.html#connector-options");
+                        + "see https://ververica.github.io/flink-cdc-connectors/master/content/connectors/mysql-cdc"
+                        + ".html#connector-options");
         System.out.println();
 
         System.out.println("Paimon catalog and table sink conf syntax:");
