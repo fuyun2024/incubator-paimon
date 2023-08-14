@@ -18,49 +18,29 @@
 
 package org.apache.paimon.flink.action.cdc.mysql;
 
+import org.apache.flink.configuration.Configuration;
+import org.apache.paimon.flink.action.cdc.mysql.sf.MultipleHostOptions;
+
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.paimon.catalog.Catalog;
-import org.apache.paimon.catalog.CatalogContext;
-import org.apache.paimon.catalog.CatalogFactory;
-import org.apache.paimon.catalog.Identifier;
-import org.apache.paimon.flink.action.cdc.mysql.sf.MultipleHostOptions;
-import org.apache.paimon.fs.Path;
-import org.apache.paimon.schema.SchemaChange;
-import org.apache.paimon.schema.SchemaManager;
-import org.apache.paimon.table.FileStoreTable;
-import org.apache.paimon.types.DataField;
-import org.apache.paimon.types.DataType;
-import org.apache.paimon.types.DataTypes;
-import org.apache.paimon.types.RowType;
-import org.apache.paimon.utils.JsonSerdeUtil;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.Statement;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.stream.Collectors;
-
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** IT cases for {@link MySqlSyncTableAction}. */
 public class MySqlSyncMultipleTable {
 
     @Test
-    @Timeout(60)
-    public void testSchemaEvolution() throws Exception {
+    public void multipleHostToPaimon() throws Exception {
+        System.setProperty("HADOOP_USER_NAME", "hive");
+
         Map<String, String> mySqlConfig = new HashMap<>();
         mySqlConfig.put(MultipleHostOptions.MULTIPLE_HOST_ENABLED.key(), "true");
         mySqlConfig.put(MultipleHostOptions.HOST_JSON_LIST.key(), "[{\"hostname\":\"annotation-m.dbsit.sfcloud" +
@@ -68,31 +48,46 @@ public class MySqlSyncMultipleTable {
                 "\"table\":\"gx_fen1\"},{\"hostname\":\"annotation-m.dbsit.sfcloud.local\",\"port\":3306," +
                 "\"username\":\"bincanal\",\"password\":\"sf123456\",\"database\":\"test\",\"table\":\"gx_fen2\"}]");
 
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        Configuration conf = new Configuration();
+        conf.setString("state.backend", "filesystem");
+        conf.setString("state.checkpoints.num-retained", "3");
+        conf.setString(
+                "state.checkpoints.dir",
+                "file:\\" + System.getProperty("user.dir") + "\\checkpoint-dir");
+
+        // 从某个 checkpoint 启动
+        //        conf.setString("execution.savepoint.path", "file:\\" +
+        // System.getProperty("user.dir")
+        //                + "\\checkpoint-dir\\59b16ff3a28c32c706c513cedc0199a5\\chk-5");
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(conf);
         env.setParallelism(2);
-        env.enableCheckpointing(1000);
+        env.enableCheckpointing(10 * 1000);
         env.setRestartStrategy(RestartStrategies.noRestart());
 
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Map<String, String> tableConfig = new HashMap<>();
         tableConfig.put("bucket", String.valueOf(random.nextInt(3) + 1));
         tableConfig.put("sink.parallelism", String.valueOf(random.nextInt(3) + 1));
+
+
+        Map<String, String> catalogConfig = new HashMap<>();
+        catalogConfig.put("metastore", "hive");
+        catalogConfig.put("uri", "thrift://10.202.77.200:9083");
         MySqlSyncTableAction action =
                 new MySqlSyncTableAction(
                         mySqlConfig,
-                        "hdfs://test-cluster/user/hive/warehouse/sssjh_mysql/",
-                        "test",
+                        "hdfs://test-cluster/user/hive/warehouse/",
+                        "sssjh_mysql",
                         "gx_fen",
-                        Collections.singletonList("days"),
-                        Arrays.asList("id", "days"),
-                        Collections.emptyMap(),
+                        Collections.singletonList("inc_day"),
+                        Arrays.asList("id", "inc_day"),
+                        Arrays.asList("inc_day=formatDate(dt,yyyyMMdd)"),
+                        catalogConfig,
                         tableConfig);
         action.build(env);
-        JobClient client = env.executeAsync();
-        while (true) {
-            JobStatus status = client.getJobStatus().get();
-            Thread.sleep(1000);
-        }
+        env.execute();
     }
 
 }

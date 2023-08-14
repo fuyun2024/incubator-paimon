@@ -28,6 +28,7 @@ import java.io.Serializable;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.List;
 
@@ -36,7 +37,8 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
 /** Produce a computation result for computed column. */
 public interface Expression extends Serializable {
 
-    List<String> SUPPORTED_EXPRESSION = Arrays.asList("year", "substring", "truncate");
+    List<String> SUPPORTED_EXPRESSION =
+            Arrays.asList("year", "month", "day", "hour", "formatDate", "substring", "truncate");
 
     /** Return name of referenced field. */
     String fieldReference();
@@ -52,6 +54,14 @@ public interface Expression extends Serializable {
         switch (exprName) {
             case "year":
                 return year(fieldReference);
+            case "month":
+                return month(fieldReference);
+            case "day":
+                return day(fieldReference);
+            case "hour":
+                return hour(fieldReference);
+            case "formatDate":
+                return formatDate(fieldReference, literals);
             case "substring":
                 return substring(fieldReference, literals);
             case "truncate":
@@ -67,6 +77,22 @@ public interface Expression extends Serializable {
 
     static Expression year(String fieldReference) {
         return new YearComputer(fieldReference);
+    }
+
+    static Expression month(String fieldReference) {
+        return new MonthComputer(fieldReference);
+    }
+
+    static Expression day(String fieldReference) {
+        return new DayComputer(fieldReference);
+    }
+
+    static Expression hour(String fieldReference) {
+        return new HourComputer(fieldReference);
+    }
+
+    static Expression formatDate(String fieldReference, String... literals) {
+        return new FormatDate(fieldReference, literals[0]);
     }
 
     static Expression substring(String fieldReference, String... literals) {
@@ -136,6 +162,120 @@ public interface Expression extends Serializable {
         }
     }
 
+    /** Compute month from a time input. */
+    final class MonthComputer implements Expression {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String fieldReference;
+
+        private MonthComputer(String fieldReference) {
+            this.fieldReference = fieldReference;
+        }
+
+        @Override
+        public String fieldReference() {
+            return fieldReference;
+        }
+
+        @Override
+        public DataType outputType() {
+            return DataTypes.INT();
+        }
+
+        @Override
+        public String eval(String input) {
+            LocalDateTime localDateTime = DateTimeUtils.toLocalDateTime(input, 0);
+            return String.valueOf(localDateTime.getMonthValue());
+        }
+    }
+
+    /** Compute day from a time input. */
+    final class DayComputer implements Expression {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String fieldReference;
+
+        private DayComputer(String fieldReference) {
+            this.fieldReference = fieldReference;
+        }
+
+        @Override
+        public String fieldReference() {
+            return fieldReference;
+        }
+
+        @Override
+        public DataType outputType() {
+            return DataTypes.INT();
+        }
+
+        @Override
+        public String eval(String input) {
+            LocalDateTime localDateTime = DateTimeUtils.toLocalDateTime(input, 0);
+            return String.valueOf(localDateTime.getDayOfMonth());
+        }
+    }
+
+    /** Convert date format based on time input. */
+    final class FormatDate implements Expression {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String fieldReference;
+        private final String format;
+
+        private FormatDate(String fieldReference, String format) {
+            this.fieldReference = fieldReference;
+            this.format = format;
+        }
+
+        @Override
+        public String fieldReference() {
+            return fieldReference;
+        }
+
+        @Override
+        public DataType outputType() {
+            return DataTypes.STRING();
+        }
+
+        @Override
+        public String eval(String input) {
+            LocalDateTime localDateTime = DateTimeUtils.toLocalDateTime(input, 0);
+            return localDateTime.format(DateTimeFormatter.ofPattern(format));
+        }
+    }
+
+    /** Compute hour from a time input. */
+    final class HourComputer implements Expression {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String fieldReference;
+
+        private HourComputer(String fieldReference) {
+            this.fieldReference = fieldReference;
+        }
+
+        @Override
+        public String fieldReference() {
+            return fieldReference;
+        }
+
+        @Override
+        public DataType outputType() {
+            return DataTypes.INT();
+        }
+
+        @Override
+        public String eval(String input) {
+            LocalDateTime localDateTime = DateTimeUtils.toLocalDateTime(input, 0);
+            return String.valueOf(localDateTime.getHour());
+        }
+    }
+
     /** Get substring using {@link String#substring}. */
     final class Substring implements Expression {
 
@@ -185,9 +325,9 @@ public interface Expression extends Serializable {
 
         private final String fieldReference;
 
-        private DataType fieldType;
+        private final DataType fieldType;
 
-        private int width;
+        private final int width;
 
         TruncateComputer(String fieldReference, DataType fieldType, String literal) {
             this.fieldReference = fieldReference;
@@ -217,11 +357,11 @@ public interface Expression extends Serializable {
             switch (fieldType.getTypeRoot()) {
                 case TINYINT:
                 case SMALLINT:
-                    return String.valueOf(truncateShort(width, Short.valueOf(input)));
+                    return String.valueOf(truncateShort(width, Short.parseShort(input)));
                 case INTEGER:
-                    return String.valueOf(truncateInt(width, Integer.valueOf(input)));
+                    return String.valueOf(truncateInt(width, Integer.parseInt(input)));
                 case BIGINT:
-                    return String.valueOf(truncateLong(width, Long.valueOf(input)));
+                    return String.valueOf(truncateLong(width, Long.parseLong(input)));
                 case DECIMAL:
                     return truncateDecimal(BigInteger.valueOf(width), new BigDecimal(input))
                             .toString();
